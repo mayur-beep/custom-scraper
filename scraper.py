@@ -11,6 +11,7 @@ from urllib.parse import urljoin, quote
 import hashlib
 import json
 import os
+import re
 
 app = Flask(__name__)
 
@@ -29,6 +30,8 @@ def scrape_js_website(url: str, config: dict) -> list:
         "link_selector": "a",                 # CSS selector for link within item
         "description_selector": ".summary",   # CSS selector for description (optional)
         "image_selector": "img",              # CSS selector for image (optional)
+        "date_selector": ".date",             # CSS selector for date (optional)
+        "date_format": "%d-%m-%Y",            # Date format (default: DD-MM-YYYY)
     }
     """
     items = []
@@ -74,6 +77,24 @@ def scrape_js_website(url: str, config: dict) -> list:
                         if img_el:
                             item["image"] = img_el.get_attribute("src")
 
+                    # Get date (optional)
+                    date_selector = config.get("date_selector")
+                    if date_selector:
+                        date_el = element.query_selector(date_selector)
+                        if date_el:
+                            date_text = date_el.inner_text().strip()
+                            date_fmt = config.get("date_format", "%d-%m-%Y")
+                            try:
+                                item["date"] = datetime.strptime(date_text, date_fmt).replace(tzinfo=timezone.utc)
+                            except ValueError:
+                                # Try to extract a date pattern from the text
+                                date_match = re.search(r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}', date_text)
+                                if date_match:
+                                    try:
+                                        item["date"] = datetime.strptime(date_match.group(), date_fmt).replace(tzinfo=timezone.utc)
+                                    except ValueError:
+                                        pass
+
                     if item.get("title") and item.get("link"):
                         items.append(item)
 
@@ -109,7 +130,7 @@ def generate_rss(items: list, feed_title: str, feed_url: str) -> str:
         if item.get("image"):
             fe.enclosure(item["image"], 0, "image/jpeg")
 
-        fe.published(datetime.now(timezone.utc))
+        fe.published(item.get("date", datetime.now(timezone.utc)))
 
     return fg.rss_str(pretty=True).decode("utf-8")
 
@@ -126,9 +147,11 @@ def create_feed():
     - link: CSS selector for link (default: a)
     - desc: CSS selector for description (optional)
     - img: CSS selector for image (optional)
+    - date: CSS selector for date (optional)
+    - datefmt: Date format string (default: %d-%m-%Y, i.e. DD-MM-YYYY)
 
     Example:
-    /feed?url=https://example.com&item=.post&title=h2&link=a
+    /feed?url=https://example.com&item=.post&title=h2&link=a&date=.date&datefmt=%d-%m-%Y
     """
     url = request.args.get("url")
     if not url:
@@ -140,6 +163,8 @@ def create_feed():
         "link_selector": request.args.get("link", "a"),
         "description_selector": request.args.get("desc"),
         "image_selector": request.args.get("img"),
+        "date_selector": request.args.get("date"),
+        "date_format": request.args.get("datefmt", "%d-%m-%Y"),
     }
 
     # Check cache
@@ -228,17 +253,19 @@ def home():
 GET /feed?url=WEBSITE_URL&item=CSS_SELECTOR&title=CSS_SELECTOR&link=CSS_SELECTOR
 
 Parameters:
-- url   (required): Website URL to scrape
-- item  (optional): CSS selector for each item (default: article)
-- title (optional): CSS selector for title (default: h2, h3, h4)
-- link  (optional): CSS selector for link (default: a)
-- desc  (optional): CSS selector for description
-- img   (optional): CSS selector for image
+- url     (required): Website URL to scrape
+- item    (optional): CSS selector for each item (default: article)
+- title   (optional): CSS selector for title (default: h2, h3, h4)
+- link    (optional): CSS selector for link (default: a)
+- desc    (optional): CSS selector for description
+- img     (optional): CSS selector for image
+- date    (optional): CSS selector for date
+- datefmt (optional): Date format (default: %d-%m-%Y i.e. DD-MM-YYYY)
         </pre>
 
         <h2>Example</h2>
         <pre style="background: #f4f4f4; padding: 15px; border-radius: 5px;">
-/feed?url=https://news.bitcoin.com/press-releases/&item=.story-card&title=h6&link=a&img=img
+/feed?url=https://news.bitcoin.com/press-releases/&item=.story-card&title=h6&link=a&img=img&date=.date&datefmt=%d-%m-%Y
         </pre>
 
         <h2>Try It</h2>
@@ -249,6 +276,9 @@ Parameters:
             <p><label>Link selector: <input type="text" name="link" value="a" style="width: 200px;"></label></p>
             <p><label>Description selector: <input type="text" name="desc" style="width: 200px;"></label></p>
             <p><label>Image selector: <input type="text" name="img" style="width: 200px;"></label></p>
+            <p><label>Date selector: <input type="text" name="date" style="width: 200px;" placeholder=".date, time, .timestamp"></label></p>
+            <p><label>Date format: <input type="text" name="datefmt" value="%d-%m-%Y" style="width: 200px;" placeholder="%d-%m-%Y"></label>
+                <small style="color: #666;">(DD-MM-YYYY)</small></label></p>
             <p><button type="submit">Generate Feed</button></p>
         </form>
     </body>

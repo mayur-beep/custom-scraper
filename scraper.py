@@ -4,25 +4,102 @@ Uses Playwright to render JS and generate RSS feeds
 """
 
 from flask import Flask, Response, request
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Error as PlaywrightError
 from feedgen.feed import FeedGenerator
 from datetime import datetime, timezone
 from urllib.parse import urljoin, quote
+import atexit
 import hashlib
 import json
+import logging
 import os
 import re
+import threading
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Cache to avoid re-scraping too frequently
 cache = {}
 CACHE_DURATION = 600  # 10 minutes
 
+# --- Persistent Browser Singleton ---
+
+_playwright = None
+_browser = None
+_browser_lock = threading.Lock()
+
+CHROMIUM_ARGS = [
+    "--single-process",
+    "--no-zygote",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-sandbox",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--mute-audio",
+    "--hide-scrollbars",
+]
+
+
+def _get_browser():
+    """Get or create the persistent browser instance."""
+    global _playwright, _browser
+
+    if _browser and _browser.is_connected():
+        return _browser
+
+    # Browser is dead or never started -- (re)launch
+    logger.info("Launching persistent Chromium browser...")
+
+    # Clean up old instances if they exist
+    if _browser:
+        try:
+            _browser.close()
+        except Exception:
+            pass
+    if _playwright:
+        try:
+            _playwright.stop()
+        except Exception:
+            pass
+
+    _playwright = sync_playwright().start()
+    _browser = _playwright.chromium.launch(
+        headless=True,
+        args=CHROMIUM_ARGS,
+    )
+    logger.info("Browser launched successfully.")
+    return _browser
+
+
+def _shutdown_browser():
+    """Clean up browser on process exit."""
+    global _playwright, _browser
+    logger.info("Shutting down browser...")
+    if _browser:
+        try:
+            _browser.close()
+        except Exception:
+            pass
+    if _playwright:
+        try:
+            _playwright.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_browser)
+
 
 def scrape_js_website(url: str, config: dict) -> list:
     """
-    Scrape a JavaScript-rendered website using Playwright
+    Scrape a JavaScript-rendered website using a persistent browser.
 
     config = {
         "item_selector": "article",           # CSS selector for each item
@@ -35,12 +112,13 @@ def scrape_js_website(url: str, config: dict) -> list:
     }
     """
     items = []
+    page = None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
+    with _browser_lock:
         try:
+            browser = _get_browser()
+            page = browser.new_page()
+
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(5000)  # Extra wait for dynamic content
 
@@ -99,13 +177,21 @@ def scrape_js_website(url: str, config: dict) -> list:
                         items.append(item)
 
                 except Exception as e:
-                    print(f"Error parsing item: {e}")
+                    logger.warning(f"Error parsing item: {e}")
                     continue
 
+        except PlaywrightError as e:
+            logger.error(f"Playwright error scraping {url}: {e}")
+            raise
         except Exception as e:
-            print(f"Error scraping {url}: {e}")
+            logger.error(f"Error scraping {url}: {e}")
+            raise
         finally:
-            browser.close()
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     return items
 
@@ -175,7 +261,21 @@ def create_feed():
         return Response(cached["data"], mimetype="application/rss+xml")
 
     # Scrape and generate
-    items = scrape_js_website(url, config)
+    try:
+        items = scrape_js_website(url, config)
+    except TimeoutError:
+        logger.error(f"Timeout scraping {url}")
+        return "Scraping timed out. The target page took too long to load.", 504
+    except PlaywrightError as e:
+        error_msg = str(e)
+        if "Target" in error_msg and "closed" in error_msg:
+            logger.error(f"Browser target closed while scraping {url}: {e}")
+            return "Browser error (target closed). Please retry.", 503
+        logger.error(f"Playwright error for {url}: {e}")
+        return "Scraping failed due to a browser error. Please retry.", 503
+    except Exception as e:
+        logger.error(f"Unexpected error scraping {url}: {e}")
+        return "Internal scraping error. Please retry.", 500
 
     if not items:
         return "No items found. Check your CSS selectors.", 404
@@ -195,11 +295,12 @@ def debug_page():
     if not url:
         return "Missing 'url' parameter", 400
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
+    page = None
+    with _browser_lock:
         try:
+            browser = _get_browser()
+            page = browser.new_page()
+
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(5000)
 
@@ -219,8 +320,6 @@ def debug_page():
                 if elements:
                     results.append(f"{selector}: {len(elements)} elements found")
 
-            browser.close()
-
             return f"""
             <html>
             <head><title>Debug: {url}</title></head>
@@ -233,9 +332,18 @@ def debug_page():
             </body>
             </html>
             """
+        except TimeoutError:
+            return "Debug timed out. The target page took too long to load.", 504
+        except PlaywrightError as e:
+            return f"Browser error: {e}", 503
         except Exception as e:
-            browser.close()
             return f"Error: {e}", 500
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
 
 @app.route("/")
@@ -287,4 +395,4 @@ Parameters:
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)

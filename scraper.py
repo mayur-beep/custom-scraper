@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import threading
 
 app = Flask(__name__)
 
@@ -29,10 +28,8 @@ CACHE_DURATION = 600  # 10 minutes
 
 _playwright = None
 _browser = None
-_browser_lock = threading.Lock()
 
 CHROMIUM_ARGS = [
-    "--single-process",
     "--no-zygote",
     "--disable-dev-shm-usage",
     "--disable-gpu",
@@ -117,10 +114,7 @@ def _is_browser_crash(error: Exception) -> bool:
 
 
 def _scrape_page(url: str, config: dict) -> list:
-    """
-    Core scraping logic -- opens a page, scrapes items, closes page.
-    Must be called while holding _browser_lock.
-    """
+    """Core scraping logic -- opens a page, scrapes items, closes page."""
     items = []
     browser = _get_browser()
     page = browser.new_page()
@@ -200,19 +194,19 @@ def scrape_js_website(url: str, config: dict) -> list:
     """
     Scrape with automatic retry on browser crash.
     If the browser dies mid-request, restart it and retry once.
+    Gunicorn sync worker ensures only one request runs at a time.
     """
     max_attempts = 2
 
-    with _browser_lock:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return _scrape_page(url, config)
-            except Exception as e:
-                if attempt < max_attempts and _is_browser_crash(e):
-                    logger.warning(f"Browser crashed on attempt {attempt}, restarting: {e}")
-                    _force_restart_browser()
-                    continue
-                raise
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _scrape_page(url, config)
+        except Exception as e:
+            if attempt < max_attempts and _is_browser_crash(e):
+                logger.warning(f"Browser crashed on attempt {attempt}, restarting: {e}")
+                _force_restart_browser()
+                continue
+            raise
 
 
 def generate_rss(items: list, feed_title: str, feed_url: str) -> str:
@@ -314,62 +308,61 @@ def debug_page():
     if not url:
         return "Missing 'url' parameter", 400
 
-    with _browser_lock:
-        last_error = None
-        for attempt in range(1, 3):
-            page = None
-            try:
-                browser = _get_browser()
-                page = browser.new_page()
+    last_error = None
+    for attempt in range(1, 3):
+        page = None
+        try:
+            browser = _get_browser()
+            page = browser.new_page()
 
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(5000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(5000)
 
-                # Get page HTML
-                html = page.content()
+            # Get page HTML
+            html = page.content()
 
-                # Find all potential item containers
-                selectors_to_try = [
-                    "article", ".article", ".post", ".story", ".card",
-                    ".story-card", ".news-item", ".entry", "[class*='story']",
-                    "[class*='article']", "[class*='post']", "[class*='card']"
-                ]
+            # Find all potential item containers
+            selectors_to_try = [
+                "article", ".article", ".post", ".story", ".card",
+                ".story-card", ".news-item", ".entry", "[class*='story']",
+                "[class*='article']", "[class*='post']", "[class*='card']"
+            ]
 
-                results = []
-                for selector in selectors_to_try:
-                    elements = page.query_selector_all(selector)
-                    if elements:
-                        results.append(f"{selector}: {len(elements)} elements found")
+            results = []
+            for selector in selectors_to_try:
+                elements = page.query_selector_all(selector)
+                if elements:
+                    results.append(f"{selector}: {len(elements)} elements found")
 
-                return f"""
-                <html>
-                <head><title>Debug: {url}</title></head>
-                <body style="font-family: monospace;">
-                    <h1>Debug: {url}</h1>
-                    <h2>Potential selectors found:</h2>
-                    <pre>{"<br>".join(results) if results else "No common selectors found"}</pre>
-                    <h2>Page HTML (first 10000 chars):</h2>
-                    <textarea style="width:100%; height:500px;">{html[:10000]}</textarea>
-                </body>
-                </html>
-                """
-            except TimeoutError:
-                return "Debug timed out. The target page took too long to load.", 504
-            except Exception as e:
-                last_error = e
-                if attempt < 2 and _is_browser_crash(e):
-                    logger.warning(f"Browser crashed during debug (attempt {attempt}), restarting: {e}")
-                    _force_restart_browser()
-                    continue
-                return f"Error: {e}", 500
-            finally:
-                if page:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+            return f"""
+            <html>
+            <head><title>Debug: {url}</title></head>
+            <body style="font-family: monospace;">
+                <h1>Debug: {url}</h1>
+                <h2>Potential selectors found:</h2>
+                <pre>{"<br>".join(results) if results else "No common selectors found"}</pre>
+                <h2>Page HTML (first 10000 chars):</h2>
+                <textarea style="width:100%; height:500px;">{html[:10000]}</textarea>
+            </body>
+            </html>
+            """
+        except TimeoutError:
+            return "Debug timed out. The target page took too long to load.", 504
+        except Exception as e:
+            last_error = e
+            if attempt < 2 and _is_browser_crash(e):
+                logger.warning(f"Browser crashed during debug (attempt {attempt}), restarting: {e}")
+                _force_restart_browser()
+                continue
+            return f"Error: {e}", 500
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
-        return f"Error after retries: {last_error}", 500
+    return f"Error after retries: {last_error}", 500
 
 
 @app.route("/")

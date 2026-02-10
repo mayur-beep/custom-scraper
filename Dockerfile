@@ -11,4 +11,4 @@ COPY scraper.py .
 
 EXPOSE 5000
 
-CMD ["gunicorn", "scraper:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "2", "--timeout", "120", "--max-requests", "200", "--max-requests-jitter", "20"]
+CMD ["gunicorn", "scraper:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "120", "--max-requests", "200", "--max-requests-jitter", "20"]

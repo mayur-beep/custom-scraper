@@ -55,19 +55,29 @@ def _get_browser():
         return _browser
 
     # Browser is dead or never started -- (re)launch
-    logger.info("Launching persistent Chromium browser...")
+    _force_restart_browser()
+    return _browser
 
-    # Clean up old instances if they exist
+
+def _force_restart_browser():
+    """Unconditionally kill and relaunch the browser."""
+    global _playwright, _browser
+
+    logger.info("(Re)launching Chromium browser...")
+
+    # Clean up old instances
     if _browser:
         try:
             _browser.close()
         except Exception:
             pass
+        _browser = None
     if _playwright:
         try:
             _playwright.stop()
         except Exception:
             pass
+        _playwright = None
 
     _playwright = sync_playwright().start()
     _browser = _playwright.chromium.launch(
@@ -75,7 +85,6 @@ def _get_browser():
         args=CHROMIUM_ARGS,
     )
     logger.info("Browser launched successfully.")
-    return _browser
 
 
 def _shutdown_browser():
@@ -97,103 +106,113 @@ def _shutdown_browser():
 atexit.register(_shutdown_browser)
 
 
-def scrape_js_website(url: str, config: dict) -> list:
-    """
-    Scrape a JavaScript-rendered website using a persistent browser.
+def _is_browser_crash(error: Exception) -> bool:
+    """Check if an error indicates the browser process died."""
+    msg = str(error).lower()
+    return any(keyword in msg for keyword in [
+        "target closed", "browser has been closed", "connection closed",
+        "target page, context or browser has been closed",
+        "browser.newpage", "page.goto",
+    ])
 
-    config = {
-        "item_selector": "article",           # CSS selector for each item
-        "title_selector": "h2",               # CSS selector for title within item
-        "link_selector": "a",                 # CSS selector for link within item
-        "description_selector": ".summary",   # CSS selector for description (optional)
-        "image_selector": "img",              # CSS selector for image (optional)
-        "date_selector": ".date",             # CSS selector for date (optional)
-        "date_format": "%d-%m-%Y",            # Date format (default: DD-MM-YYYY)
-    }
+
+def _scrape_page(url: str, config: dict) -> list:
+    """
+    Core scraping logic -- opens a page, scrapes items, closes page.
+    Must be called while holding _browser_lock.
     """
     items = []
-    page = None
+    browser = _get_browser()
+    page = browser.new_page()
 
-    with _browser_lock:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)  # Extra wait for dynamic content
+
+        # Find all items
+        elements = page.query_selector_all(config.get("item_selector", "article"))
+
+        for element in elements[:20]:  # Limit to 20 items
+            try:
+                item = {}
+
+                # Get title
+                title_el = element.query_selector(config.get("title_selector", "h2, h3, h4"))
+                if title_el:
+                    item["title"] = title_el.inner_text().strip()
+
+                # Get link
+                link_el = element.query_selector(config.get("link_selector", "a"))
+                if link_el:
+                    href = link_el.get_attribute("href")
+                    if href:
+                        item["link"] = urljoin(url, href)
+
+                # Get description (optional)
+                desc_selector = config.get("description_selector")
+                if desc_selector:
+                    desc_el = element.query_selector(desc_selector)
+                    if desc_el:
+                        item["description"] = desc_el.inner_text().strip()
+
+                # Get image (optional)
+                img_selector = config.get("image_selector")
+                if img_selector:
+                    img_el = element.query_selector(img_selector)
+                    if img_el:
+                        item["image"] = img_el.get_attribute("src")
+
+                # Get date (optional)
+                date_selector = config.get("date_selector")
+                if date_selector:
+                    date_el = element.query_selector(date_selector)
+                    if date_el:
+                        date_text = date_el.inner_text().strip()
+                        date_fmt = config.get("date_format", "%d-%m-%Y")
+                        try:
+                            item["date"] = datetime.strptime(date_text, date_fmt).replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            # Try to extract a date pattern from the text
+                            date_match = re.search(r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}', date_text)
+                            if date_match:
+                                try:
+                                    item["date"] = datetime.strptime(date_match.group(), date_fmt).replace(tzinfo=timezone.utc)
+                                except ValueError:
+                                    pass
+
+                if item.get("title") and item.get("link"):
+                    items.append(item)
+
+            except Exception as e:
+                logger.warning(f"Error parsing item: {e}")
+                continue
+
+    finally:
         try:
-            browser = _get_browser()
-            page = browser.new_page()
-
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(5000)  # Extra wait for dynamic content
-
-            # Find all items
-            elements = page.query_selector_all(config.get("item_selector", "article"))
-
-            for element in elements[:20]:  # Limit to 20 items
-                try:
-                    item = {}
-
-                    # Get title
-                    title_el = element.query_selector(config.get("title_selector", "h2, h3, h4"))
-                    if title_el:
-                        item["title"] = title_el.inner_text().strip()
-
-                    # Get link
-                    link_el = element.query_selector(config.get("link_selector", "a"))
-                    if link_el:
-                        href = link_el.get_attribute("href")
-                        if href:
-                            item["link"] = urljoin(url, href)
-
-                    # Get description (optional)
-                    desc_selector = config.get("description_selector")
-                    if desc_selector:
-                        desc_el = element.query_selector(desc_selector)
-                        if desc_el:
-                            item["description"] = desc_el.inner_text().strip()
-
-                    # Get image (optional)
-                    img_selector = config.get("image_selector")
-                    if img_selector:
-                        img_el = element.query_selector(img_selector)
-                        if img_el:
-                            item["image"] = img_el.get_attribute("src")
-
-                    # Get date (optional)
-                    date_selector = config.get("date_selector")
-                    if date_selector:
-                        date_el = element.query_selector(date_selector)
-                        if date_el:
-                            date_text = date_el.inner_text().strip()
-                            date_fmt = config.get("date_format", "%d-%m-%Y")
-                            try:
-                                item["date"] = datetime.strptime(date_text, date_fmt).replace(tzinfo=timezone.utc)
-                            except ValueError:
-                                # Try to extract a date pattern from the text
-                                date_match = re.search(r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}', date_text)
-                                if date_match:
-                                    try:
-                                        item["date"] = datetime.strptime(date_match.group(), date_fmt).replace(tzinfo=timezone.utc)
-                                    except ValueError:
-                                        pass
-
-                    if item.get("title") and item.get("link"):
-                        items.append(item)
-
-                except Exception as e:
-                    logger.warning(f"Error parsing item: {e}")
-                    continue
-
-        except PlaywrightError as e:
-            logger.error(f"Playwright error scraping {url}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Error scraping {url}: {e}")
-            raise
-        finally:
-            if page:
-                try:
-                    page.close()
-                except Exception:
-                    pass
+            page.close()
+        except Exception:
+            pass
 
     return items
+
+
+def scrape_js_website(url: str, config: dict) -> list:
+    """
+    Scrape with automatic retry on browser crash.
+    If the browser dies mid-request, restart it and retry once.
+    """
+    max_attempts = 2
+
+    with _browser_lock:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return _scrape_page(url, config)
+            except Exception as e:
+                if attempt < max_attempts and _is_browser_crash(e):
+                    logger.warning(f"Browser crashed on attempt {attempt}, restarting: {e}")
+                    _force_restart_browser()
+                    continue
+                raise
 
 
 def generate_rss(items: list, feed_title: str, feed_url: str) -> str:
@@ -295,55 +314,62 @@ def debug_page():
     if not url:
         return "Missing 'url' parameter", 400
 
-    page = None
     with _browser_lock:
-        try:
-            browser = _get_browser()
-            page = browser.new_page()
+        last_error = None
+        for attempt in range(1, 3):
+            page = None
+            try:
+                browser = _get_browser()
+                page = browser.new_page()
 
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(5000)
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(5000)
 
-            # Get page HTML
-            html = page.content()
+                # Get page HTML
+                html = page.content()
 
-            # Find all potential item containers
-            selectors_to_try = [
-                "article", ".article", ".post", ".story", ".card",
-                ".story-card", ".news-item", ".entry", "[class*='story']",
-                "[class*='article']", "[class*='post']", "[class*='card']"
-            ]
+                # Find all potential item containers
+                selectors_to_try = [
+                    "article", ".article", ".post", ".story", ".card",
+                    ".story-card", ".news-item", ".entry", "[class*='story']",
+                    "[class*='article']", "[class*='post']", "[class*='card']"
+                ]
 
-            results = []
-            for selector in selectors_to_try:
-                elements = page.query_selector_all(selector)
-                if elements:
-                    results.append(f"{selector}: {len(elements)} elements found")
+                results = []
+                for selector in selectors_to_try:
+                    elements = page.query_selector_all(selector)
+                    if elements:
+                        results.append(f"{selector}: {len(elements)} elements found")
 
-            return f"""
-            <html>
-            <head><title>Debug: {url}</title></head>
-            <body style="font-family: monospace;">
-                <h1>Debug: {url}</h1>
-                <h2>Potential selectors found:</h2>
-                <pre>{"<br>".join(results) if results else "No common selectors found"}</pre>
-                <h2>Page HTML (first 10000 chars):</h2>
-                <textarea style="width:100%; height:500px;">{html[:10000]}</textarea>
-            </body>
-            </html>
-            """
-        except TimeoutError:
-            return "Debug timed out. The target page took too long to load.", 504
-        except PlaywrightError as e:
-            return f"Browser error: {e}", 503
-        except Exception as e:
-            return f"Error: {e}", 500
-        finally:
-            if page:
-                try:
-                    page.close()
-                except Exception:
-                    pass
+                return f"""
+                <html>
+                <head><title>Debug: {url}</title></head>
+                <body style="font-family: monospace;">
+                    <h1>Debug: {url}</h1>
+                    <h2>Potential selectors found:</h2>
+                    <pre>{"<br>".join(results) if results else "No common selectors found"}</pre>
+                    <h2>Page HTML (first 10000 chars):</h2>
+                    <textarea style="width:100%; height:500px;">{html[:10000]}</textarea>
+                </body>
+                </html>
+                """
+            except TimeoutError:
+                return "Debug timed out. The target page took too long to load.", 504
+            except Exception as e:
+                last_error = e
+                if attempt < 2 and _is_browser_crash(e):
+                    logger.warning(f"Browser crashed during debug (attempt {attempt}), restarting: {e}")
+                    _force_restart_browser()
+                    continue
+                return f"Error: {e}", 500
+            finally:
+                if page:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+
+        return f"Error after retries: {last_error}", 500
 
 
 @app.route("/")
